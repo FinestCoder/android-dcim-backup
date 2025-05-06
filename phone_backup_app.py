@@ -9,7 +9,7 @@ from PIL.ExifTags import TAGS
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QLabel,
-    QFrame, QMessageBox, QFileDialog, QInputDialog
+    QFrame, QMessageBox, QFileDialog, QInputDialog, QLineEdit
 )
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt
@@ -233,6 +233,11 @@ class BackupApp(QWidget):
         self.open_folder_btn.setMinimumHeight(45)
         self.open_folder_btn.clicked.connect(self.open_backup_folder)
 
+        # Add this button to the GUI inside __init__ method of BackupApp
+        self.change_folder_btn = QPushButton("🔧 Change Folder Path")
+        self.change_folder_btn.setMinimumHeight(45)
+        self.change_folder_btn.clicked.connect(self.handle_change_folder)
+
         self.status_label = QLabel("✅ Ready")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setStyleSheet("color: #666; font-size: 13px; padding: 6px;")
@@ -244,6 +249,7 @@ class BackupApp(QWidget):
         layout.addWidget(self.undo_btn)
         layout.addWidget(self.delete_btn)
         layout.addWidget(self.open_folder_btn)
+        layout.addWidget(self.change_folder_btn)
         layout.addWidget(QFrame(frameShape=QFrame.HLine))
         layout.addWidget(self.status_label)
 
@@ -278,6 +284,7 @@ class BackupApp(QWidget):
             self.status_label.setText(f"🔁 Organization undone.\n📁 Photos moved to: {backup_path}")
         else:
             self.status_label.setText("❌ Undo canceled.")
+
     def open_backup_folder(self):
         folder_path = get_backup_folder()
         if os.path.exists(folder_path):
@@ -288,7 +295,54 @@ class BackupApp(QWidget):
             else:
                 subprocess.run(['xdg-open', folder_path])
 
+    def handle_change_folder(self):
+        old_backup_folder = get_backup_folder()
+        new_base_folder = QFileDialog.getExistingDirectory(self, "Select New Backup Folder")
 
+        if not new_base_folder:
+            self.status_label.setText("❌ Folder change cancelled.")
+            return
+
+        new_backup_folder = os.path.join(new_base_folder, "DCIM_Backups")
+        os.makedirs(new_backup_folder, exist_ok=True)
+
+        old_files = [
+            f for f in os.listdir(old_backup_folder)
+            if os.path.isfile(os.path.join(old_backup_folder, f)) and f != "backup_log.txt"
+        ]
+
+        if old_files:
+            text, ok = QInputDialog.getText(
+                self,
+                "Move Existing Backups?",
+                "Photos exist in the previous backup folder.\n\n"
+                "Type 'move all and match' to move all to the new folder and update configuration:",
+                QLineEdit.Normal
+            )
+
+            if ok and text.strip().lower() == "move all and match":
+                for file in old_files:
+                    src = os.path.join(old_backup_folder, file)
+                    dest = os.path.join(new_backup_folder, file)
+                    if not os.path.exists(dest):
+                        shutil.move(src, dest)
+                    else:
+                        base, ext = os.path.splitext(file)
+                        count = 1
+                        while True:
+                            new_name = f"{base}_{count}{ext}"
+                            new_dest = os.path.join(new_backup_folder, new_name)
+                            if not os.path.exists(new_dest):
+                                shutil.move(src, new_dest)
+                                break
+                            count += 1
+                self.status_label.setText(f"✅ All files moved to: {new_backup_folder}")
+            else:
+                self.status_label.setText("❌ Move skipped. Old files remain in old folder.")
+
+        # Update config
+        with open(CONFIG_FILE, "w") as f:
+            f.write(new_base_folder)
 
     def handle_delete(self):
         confirm = QMessageBox.question(
