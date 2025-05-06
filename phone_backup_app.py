@@ -56,16 +56,18 @@ def calculate_hash(file_path):
 def get_backup_folder():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r") as f:
-            path = f.read().strip()
-            if os.path.isdir(path):
-                return path
+            base_path = f.read().strip()
+            full_path = os.path.join(base_path, "DCIM_Backups")
+            os.makedirs(full_path, exist_ok=True)
+            return full_path
 
-    folder = QFileDialog.getExistingDirectory(None, "Select Backup Folder")
-    if folder:
-        os.makedirs(folder, exist_ok=True)
+    base_folder = QFileDialog.getExistingDirectory(None, "Select Backup Folder")
+    if base_folder:
         with open(CONFIG_FILE, "w") as f:
-            f.write(folder)
-        return folder
+            f.write(base_folder)
+        full_path = os.path.join(base_folder, "DCIM_Backups")
+        os.makedirs(full_path, exist_ok=True)
+        return full_path
     else:
         show_message("Error", "Backup folder not selected. Exiting.")
         sys.exit()
