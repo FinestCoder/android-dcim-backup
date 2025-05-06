@@ -10,10 +10,10 @@ from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QLabel,
     QFrame, QMessageBox, QFileDialog, QInputDialog, QLineEdit,
-    QHBoxLayout, QSpacerItem, QSizePolicy
+    QHBoxLayout, QSpacerItem, QSizePolicy, QProgressBar
 )
 from PyQt5.QtGui import QFont, QIcon, QPixmap, QColor, QPalette
-from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 
@@ -22,6 +22,46 @@ DEVICE_DCIM_PATH = "/sdcard/DCIM/Camera"
 HASH_LOG_FILE = "backup_log.txt"
 CONFIG_FILE = "config.txt"
 ADB_PATH = os.path.join("adb-tools", "adb.exe")
+
+# --- Worker Thread for Backup ---
+class BackupThread(QThread):
+    update_progress = pyqtSignal(int, int, str)  # current, total, filename
+    finished = pyqtSignal(int)  # number of new files
+
+    def __init__(self):
+        super().__init__()
+        self.existing_hashes = get_existing_hashes()
+        self.backup_folder = get_backup_folder()
+        self.remote_files = list_remote_files()
+
+    def run(self):
+        new_hashes = []
+        new_files = []
+        total_files = len(self.remote_files)
+        
+        os.makedirs("temp_download", exist_ok=True)
+
+        for i, filename in enumerate(self.remote_files):
+            self.update_progress.emit(i + 1, total_files, filename)
+            
+            temp_path = os.path.join("temp_download", filename)
+            subprocess.run([ADB_PATH, "pull", f"{DEVICE_DCIM_PATH}/{filename}", temp_path], 
+                          capture_output=True)
+
+            if not os.path.exists(temp_path):
+                continue
+
+            file_hash = calculate_hash(temp_path)
+            if file_hash not in self.existing_hashes:
+                shutil.move(temp_path, os.path.join(self.backup_folder, filename))
+                new_hashes.append(file_hash)
+                new_files.append(filename)
+            else:
+                os.remove(temp_path)
+
+        update_hash_log(new_hashes)
+        shutil.rmtree("temp_download", ignore_errors=True)
+        self.finished.emit(len(new_files))
 
 # --- Utility Functions ---
 def show_message(title, message):
@@ -88,35 +128,6 @@ def get_backup_folder():
 def list_remote_files():
     result = subprocess.run([ADB_PATH, "shell", f"ls {DEVICE_DCIM_PATH}"], capture_output=True, text=True)
     return result.stdout.strip().splitlines()
-
-def perform_backup():
-    existing_hashes = get_existing_hashes()
-    backup_folder = get_backup_folder()
-    remote_files = list_remote_files()
-
-    new_hashes = []
-    new_files = []
-
-    os.makedirs("temp_download", exist_ok=True)
-
-    for filename in tqdm(remote_files, desc="Backing up"):
-        temp_path = os.path.join("temp_download", filename)
-        subprocess.run([ADB_PATH, "pull", f"{DEVICE_DCIM_PATH}/{filename}", temp_path], capture_output=True)
-
-        if not os.path.exists(temp_path):
-            continue
-
-        file_hash = calculate_hash(temp_path)
-        if file_hash not in existing_hashes:
-            shutil.move(temp_path, os.path.join(backup_folder, filename))
-            new_hashes.append(file_hash)
-            new_files.append(filename)
-        else:
-            os.remove(temp_path)
-
-    update_hash_log(new_hashes)
-    shutil.rmtree("temp_download", ignore_errors=True)
-    return len(new_files)
 
 def extract_photo_year(file_path):
     try:
@@ -215,7 +226,7 @@ class BackupApp(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("📸 DCIM Backup Utility")
-        self.setMinimumSize(600, 600)
+        self.setMinimumSize(600, 750)
         self.setWindowIcon(QIcon(self.create_icon()))
         
         # Set modern palette
@@ -274,6 +285,53 @@ class BackupApp(QWidget):
         self.create_button("Open Backup Folder", "folder.png", "Open the backup folder", self.open_backup_folder, layout)
         self.create_button("Change Folder Path", "settings.png", "Change backup destination", self.handle_change_folder, layout)
 
+        # Progress Bar
+        self.progress_container = QFrame()
+        self.progress_container.setFrameShape(QFrame.StyledPanel)
+        self.progress_container.setStyleSheet("""
+            QFrame {
+                background-color: #f8f9fc;
+                border-radius: 8px;
+                border: 1px solid #e2e8f0;
+                padding: 12px;
+            }
+        """)
+        self.progress_container.hide()
+        
+        progress_layout = QVBoxLayout(self.progress_container)
+        progress_layout.setContentsMargins(0, 0, 0, 0)
+        progress_layout.setSpacing(8)
+        
+        self.progress_label = QLabel("Preparing backup...")
+        self.progress_label.setStyleSheet("color: #4a5568;")
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #e2e8f0;
+                border-radius: 4px;
+                text-align: center;
+                background-color: white;
+                height: 20px;
+            }
+            QProgressBar::chunk {
+                background-color: #4299e1;
+                border-radius: 3px;
+            }
+        """)
+        
+        self.current_file_label = QLabel()
+        self.current_file_label.setStyleSheet("color: #718096; font-size: 11px;")
+        self.current_file_label.setWordWrap(True)
+        
+        progress_layout.addWidget(self.progress_label)
+        progress_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.current_file_label)
+        
+        layout.addWidget(self.progress_container)
+        layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Minimum, QSizePolicy.Expanding))
+
         # Status bar
         self.status_label = QLabel("Ready to backup photos")
         self.status_label.setAlignment(Qt.AlignCenter)
@@ -287,8 +345,6 @@ class BackupApp(QWidget):
                 border: 1px solid #e2e8f0;
             }
         """)
-        
-        layout.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Minimum, QSizePolicy.Expanding))
         layout.addWidget(self.status_label)
 
         self.setLayout(layout)
@@ -363,7 +419,36 @@ class BackupApp(QWidget):
             msg.exec_()
             return
             
-        count = perform_backup()
+        # Disable buttons during backup
+        for btn in self.findChildren(QPushButton):
+            btn.setEnabled(False)
+            
+        # Show progress bar
+        self.progress_container.show()
+        self.progress_bar.setValue(0)
+        self.current_file_label.setText("")
+        self.status_label.setText("Starting backup...")
+        
+        # Create and start backup thread
+        self.backup_thread = BackupThread()
+        self.backup_thread.update_progress.connect(self.update_progress)
+        self.backup_thread.finished.connect(self.backup_finished)
+        self.backup_thread.start()
+
+    def update_progress(self, current, total, filename):
+        percent = int((current / total) * 100)
+        self.progress_bar.setValue(percent)
+        self.progress_label.setText(f"Backing up... ({current}/{total})")
+        self.current_file_label.setText(f"Current file: {filename}")
+        
+    def backup_finished(self, count):
+        # Hide progress bar
+        self.progress_container.hide()
+        
+        # Re-enable buttons
+        for btn in self.findChildren(QPushButton):
+            btn.setEnabled(True)
+            
         backup_path = get_backup_folder()
         self.status_label.setText(f"✓ {count} new photo(s) backed up\nLocation: {backup_path}")
 
