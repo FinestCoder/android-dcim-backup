@@ -1,3 +1,2 @@
 UI
-progress bar
-case: if you delete a file from backups even then its hash is stored so next itme when you backup fromphone it gets skipped this could be an  issue
+case: if you delete a file from backups even then its hash is stored so next itme when you backup fromphone it gets skipped this could be an issue

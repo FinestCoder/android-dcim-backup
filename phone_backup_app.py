@@ -70,8 +70,20 @@ class OrganizeThread(QThread):
     def __init__(self):
         super().__init__()
         self.backup_folder = get_backup_folder()
-        self.files_to_organize = [f for f in os.listdir(self.backup_folder) 
-                                if os.path.isfile(os.path.join(self.backup_folder, f))]
+        # Only include files with photo/video extensions
+        self.files_to_organize = [
+            f for f in os.listdir(self.backup_folder) 
+            if os.path.isfile(os.path.join(self.backup_folder, f)) and
+            self.is_photo_or_video(f)
+        ]
+
+    def is_photo_or_video(self, filename):
+        # List of supported photo and video extensions
+        photo_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp', '.heic'}
+        video_extensions = {'.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.m4v', '.3gp'}
+        
+        ext = os.path.splitext(filename)[1].lower()
+        return ext in photo_extensions or ext in video_extensions
 
     def run(self):
         organized_count = 0
