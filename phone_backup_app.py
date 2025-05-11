@@ -3,6 +3,7 @@ import subprocess
 import os
 import hashlib
 import shutil
+import platform
 from tqdm import tqdm
 from PIL import Image
 from PIL.ExifTags import TAGS
@@ -18,179 +19,44 @@ from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 
 # --- Config ---
-DEVICE_DCIM_PATH = "/sdcard/DCIM/Camera"
 HASH_LOG_FILE = "backup_log.txt"
 CONFIG_FILE = "config.txt"
 ADB_PATH = os.path.join("adb-tools", "adb.exe")
 
-# --- Worker Threads ---
-class BackupThread(QThread):
-    update_progress = pyqtSignal(int, int, str)  # current, total, filename
-    finished = pyqtSignal(int)  # number of new files
-
-    def __init__(self):
-        super().__init__()
-        self.existing_hashes = get_existing_hashes()
-        self.backup_folder = get_backup_folder()
-        self.remote_files = list_remote_files()
-
-    def run(self):
-        new_hashes = []
-        new_files = []
-        total_files = len(self.remote_files)
-        
-        os.makedirs("temp_download", exist_ok=True)
-
-        for i, filename in enumerate(self.remote_files):
-            self.update_progress.emit(i + 1, total_files, filename)
-            
-            temp_path = os.path.join("temp_download", filename)
-            subprocess.run([ADB_PATH, "pull", f"{DEVICE_DCIM_PATH}/{filename}", temp_path], 
-                          capture_output=True)
-
-            if not os.path.exists(temp_path):
-                continue
-
-            file_hash = calculate_hash(temp_path)
-            if file_hash not in self.existing_hashes:
-                shutil.move(temp_path, os.path.join(self.backup_folder, filename))
-                new_hashes.append(file_hash)
-                new_files.append(filename)
-            else:
-                os.remove(temp_path)
-
-        update_hash_log(new_hashes)
-        shutil.rmtree("temp_download", ignore_errors=True)
-        self.finished.emit(len(new_files))
-
-class OrganizeThread(QThread):
-    update_progress = pyqtSignal(int, int, str)  # current, total, filename
-    finished = pyqtSignal(int)  # number of files organized
-
-    def __init__(self):
-        super().__init__()
-        self.backup_folder = get_backup_folder()
-        # Only include files with photo/video extensions
-        self.files_to_organize = [
-            f for f in os.listdir(self.backup_folder) 
-            if os.path.isfile(os.path.join(self.backup_folder, f)) and
-            self.is_photo_or_video(f)
-        ]
-
-    def is_photo_or_video(self, filename):
-        # List of supported photo and video extensions
-        photo_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp', '.heic'}
-        video_extensions = {'.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.m4v', '.3gp'}
-        
-        ext = os.path.splitext(filename)[1].lower()
-        return ext in photo_extensions or ext in video_extensions
-
-    def run(self):
-        organized_count = 0
-        total_files = len(self.files_to_organize)
-        
-        for i, filename in enumerate(self.files_to_organize):
-            self.update_progress.emit(i + 1, total_files, filename)
-            
-            file_path = os.path.join(self.backup_folder, filename)
-            year = extract_photo_year(file_path)
-            if not year:
-                year = "Unknown"
-            dest_folder = os.path.join(self.backup_folder, year)
-            os.makedirs(dest_folder, exist_ok=True)
-
-            new_path = os.path.join(dest_folder, filename)
-            if not os.path.exists(new_path):
-                shutil.move(file_path, new_path)
-                organized_count += 1
-            else:
-                base, ext = os.path.splitext(filename)
-                count = 1
-                while True:
-                    new_name = f"{base}_{count}{ext}"
-                    new_path = os.path.join(dest_folder, new_name)
-                    if not os.path.exists(new_path):
-                        shutil.move(file_path, new_path)
-                        organized_count += 1
-                        break
-                    count += 1
-
-        self.finished.emit(organized_count)
-
-class UndoOrganizationThread(QThread):
-    update_progress = pyqtSignal(int, int, str)  # current, total, foldername
-    finished = pyqtSignal(int)  # number of files moved back
-
-    def __init__(self):
-        super().__init__()
-        self.backup_folder = get_backup_folder()
-        self.folders_to_process = [f for f in os.listdir(self.backup_folder) 
-                                  if os.path.isdir(os.path.join(self.backup_folder, f))]
-
-    def run(self):
-        moved_count = 0
-        total_folders = len(self.folders_to_process)
-        
-        for i, folder in enumerate(self.folders_to_process):
-            folder_path = os.path.join(self.backup_folder, folder)
-            files_in_folder = os.listdir(folder_path)
-            total_files = len(files_in_folder)
-            
-            for j, item in enumerate(files_in_folder):
-                self.update_progress.emit(i * total_files + j + 1, 
-                                         total_folders * total_files, 
-                                         f"{folder}/{item}")
-                
-                src = os.path.join(folder_path, item)
-                dst = os.path.join(self.backup_folder, item)
-                if os.path.exists(dst):
-                    base, ext = os.path.splitext(item)
-                    count = 1
-                    while True:
-                        new_name = f"{base}_{count}{ext}"
-                        dst = os.path.join(self.backup_folder, new_name)
-                        if not os.path.exists(dst):
-                            break
-                        count += 1
-                shutil.move(src, dst)
-                moved_count += 1
-            
-            os.rmdir(folder_path)
-
-        self.finished.emit(moved_count)
-
-class DeleteThread(QThread):
-    update_progress = pyqtSignal(int, int, str)  # current, total, filename
-    finished = pyqtSignal(int)  # number of files deleted
-
-    def __init__(self):
-        super().__init__()
-        self.existing_hashes = get_existing_hashes()
-        self.remote_files = list_remote_files()
-
-    def run(self):
-        deleted = 0
-        total_files = len(self.remote_files)
-        temp_dir = "temp_verify"
-        os.makedirs(temp_dir, exist_ok=True)
-
-        for i, filename in enumerate(self.remote_files):
-            self.update_progress.emit(i + 1, total_files, filename)
-            
-            temp_path = os.path.join(temp_dir, filename)
-            subprocess.run([ADB_PATH, "pull", f"{DEVICE_DCIM_PATH}/{filename}", temp_path], 
-                         capture_output=True)
-            if os.path.exists(temp_path):
-                file_hash = calculate_hash(temp_path)
-                if file_hash in self.existing_hashes:
-                    subprocess.run([ADB_PATH, "shell", f"rm {DEVICE_DCIM_PATH}/{filename}"])
-                    deleted += 1
-                os.remove(temp_path)
-
-        shutil.rmtree(temp_dir)
-        self.finished.emit(deleted)
-
 # --- Utility Functions ---
+def run_adb_command(command_args, capture_output=True):
+    """Run ADB command without showing console window"""
+    if platform.system() == "Windows":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    else:
+        startupinfo = None
+        
+    return subprocess.run([ADB_PATH] + command_args,
+                        capture_output=capture_output,
+                        text=True,
+                        startupinfo=startupinfo)
+
+def get_device_dcim_path():
+    """Try multiple common DCIM paths for different manufacturers"""
+    paths_to_try = [
+        "/sdcard/DCIM/Camera",          # Most common
+        "/storage/emulated/0/DCIM/Camera",  # Some Realme/OPPO devices
+        "/sdcard/DCIM",                 # Fallback
+        "/storage/emulated/0/DCIM",     # Another fallback
+        "/storage/sdcard0/DCIM/Camera", # Some older devices
+        "/storage/self/primary/DCIM/Camera"  # Android 11+
+    ]
+    
+    for path in paths_to_try:
+        result = run_adb_command(["shell", f"ls {path}"])
+        if result.returncode == 0 and any(
+            ".jpg" in line.lower() or ".mp4" in line.lower() 
+            for line in result.stdout.splitlines()
+        ):
+            return path
+    return "/sdcard/DCIM/Camera"  # Default if none found
+
 def show_message(title, message):
     msg = QMessageBox()
     msg.setWindowTitle(title)
@@ -208,7 +74,7 @@ def show_message(title, message):
 
 def phone_connected():
     try:
-        result = subprocess.run([ADB_PATH, "devices"], capture_output=True, text=True)
+        result = run_adb_command(["devices"])
         lines = result.stdout.strip().splitlines()
         return any("device" in line and not line.startswith("List") for line in lines)
     except Exception as e:
@@ -252,9 +118,16 @@ def get_backup_folder():
         show_message("Error", "Backup folder not selected. Exiting.")
         sys.exit()
 
-def list_remote_files():
-    result = subprocess.run([ADB_PATH, "shell", f"ls {DEVICE_DCIM_PATH}"], capture_output=True, text=True)
-    return result.stdout.strip().splitlines()
+def list_remote_files(device_path):
+    try:
+        result = run_adb_command(["shell", f"ls {device_path}"])
+        if result.returncode != 0:
+            return []
+        return [f for f in result.stdout.strip().splitlines() 
+                if f and f.lower().endswith(('.jpg', '.jpeg', '.png', '.mp4', '.mov', '.avi', '.mkv'))]
+    except Exception as e:
+        show_message("Error", f"Failed to list files: {str(e)}")
+        return []
 
 def extract_photo_year(file_path):
     try:
@@ -284,11 +157,213 @@ def extract_photo_year(file_path):
     except Exception:
         return "Unknown"
 
+# --- Worker Threads ---
+class BackupThread(QThread):
+    update_progress = pyqtSignal(int, int, str)  # current, total, filename
+    finished = pyqtSignal(int)  # number of new files
+    error_signal = pyqtSignal(str)  # error message
+
+    def __init__(self):
+        super().__init__()
+        self.existing_hashes = get_existing_hashes()
+        self.backup_folder = get_backup_folder()
+        self.device_path = get_device_dcim_path()
+        self.remote_files = list_remote_files(self.device_path)
+
+    def run(self):
+        try:
+            new_hashes = []
+            new_files = []
+            total_files = len(self.remote_files)
+            
+            if total_files == 0:
+                self.error_signal.emit("No files found in device DCIM folder")
+                return
+
+            os.makedirs("temp_download", exist_ok=True)
+
+            for i, filename in enumerate(self.remote_files):
+                self.update_progress.emit(i + 1, total_files, filename)
+                
+                temp_path = os.path.join("temp_download", filename)
+                result = run_adb_command(["pull", f"{self.device_path}/{filename}", temp_path])
+                
+                if not os.path.exists(temp_path):
+                    continue
+
+                file_hash = calculate_hash(temp_path)
+                if file_hash not in self.existing_hashes:
+                    shutil.move(temp_path, os.path.join(self.backup_folder, filename))
+                    new_hashes.append(file_hash)
+                    new_files.append(filename)
+                else:
+                    os.remove(temp_path)
+
+            update_hash_log(new_hashes)
+            shutil.rmtree("temp_download", ignore_errors=True)
+            self.finished.emit(len(new_files))
+            
+        except Exception as e:
+            self.error_signal.emit(f"Backup failed: {str(e)}")
+
+class OrganizeThread(QThread):
+    update_progress = pyqtSignal(int, int, str)  # current, total, filename
+    finished = pyqtSignal(int)  # number of files organized
+    error_signal = pyqtSignal(str)  # error message
+
+    def __init__(self):
+        super().__init__()
+        self.backup_folder = get_backup_folder()
+        self.files_to_organize = [
+            f for f in os.listdir(self.backup_folder) 
+            if os.path.isfile(os.path.join(self.backup_folder, f)) and
+            self.is_photo_or_video(f)
+        ]
+
+    def is_photo_or_video(self, filename):
+        photo_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp', '.heic'}
+        video_extensions = {'.mp4', '.mov', '.avi', '.mkv', '.flv', '.wmv', '.m4v', '.3gp'}
+        ext = os.path.splitext(filename)[1].lower()
+        return ext in photo_extensions or ext in video_extensions
+
+    def run(self):
+        try:
+            organized_count = 0
+            total_files = len(self.files_to_organize)
+            
+            if total_files == 0:
+                self.error_signal.emit("No files to organize in backup folder")
+                return
+
+            for i, filename in enumerate(self.files_to_organize):
+                self.update_progress.emit(i + 1, total_files, filename)
+                
+                file_path = os.path.join(self.backup_folder, filename)
+                year = extract_photo_year(file_path) or "Unknown"
+                dest_folder = os.path.join(self.backup_folder, year)
+                os.makedirs(dest_folder, exist_ok=True)
+
+                new_path = os.path.join(dest_folder, filename)
+                if not os.path.exists(new_path):
+                    shutil.move(file_path, new_path)
+                    organized_count += 1
+                else:
+                    base, ext = os.path.splitext(filename)
+                    count = 1
+                    while True:
+                        new_name = f"{base}_{count}{ext}"
+                        new_path = os.path.join(dest_folder, new_name)
+                        if not os.path.exists(new_path):
+                            shutil.move(file_path, new_path)
+                            organized_count += 1
+                            break
+                        count += 1
+
+            self.finished.emit(organized_count)
+            
+        except Exception as e:
+            self.error_signal.emit(f"Organization failed: {str(e)}")
+
+class UndoOrganizationThread(QThread):
+    update_progress = pyqtSignal(int, int, str)  # current, total, foldername
+    finished = pyqtSignal(int)  # number of files moved back
+    error_signal = pyqtSignal(str)  # error message
+
+    def __init__(self):
+        super().__init__()
+        self.backup_folder = get_backup_folder()
+        self.folders_to_process = [
+            f for f in os.listdir(self.backup_folder) 
+            if os.path.isdir(os.path.join(self.backup_folder, f)) and f != "adb-tools"
+        ]
+
+    def run(self):
+        try:
+            moved_count = 0
+            total_folders = len(self.folders_to_process)
+            
+            if total_folders == 0:
+                self.error_signal.emit("No organized folders found to undo")
+                return
+
+            for i, folder in enumerate(self.folders_to_process):
+                folder_path = os.path.join(self.backup_folder, folder)
+                files_in_folder = os.listdir(folder_path)
+                total_files = len(files_in_folder)
+                
+                for j, item in enumerate(files_in_folder):
+                    self.update_progress.emit(i * total_files + j + 1, 
+                                           total_folders * total_files, 
+                                           f"{folder}/{item}")
+                    
+                    src = os.path.join(folder_path, item)
+                    dst = os.path.join(self.backup_folder, item)
+                    if os.path.exists(dst):
+                        base, ext = os.path.splitext(item)
+                        count = 1
+                        while True:
+                            new_name = f"{base}_{count}{ext}"
+                            dst = os.path.join(self.backup_folder, new_name)
+                            if not os.path.exists(dst):
+                                break
+                            count += 1
+                    shutil.move(src, dst)
+                    moved_count += 1
+                
+                os.rmdir(folder_path)
+
+            self.finished.emit(moved_count)
+            
+        except Exception as e:
+            self.error_signal.emit(f"Undo organization failed: {str(e)}")
+
+class DeleteThread(QThread):
+    update_progress = pyqtSignal(int, int, str)  # current, total, filename
+    finished = pyqtSignal(int)  # number of files deleted
+    error_signal = pyqtSignal(str)  # error message
+
+    def __init__(self):
+        super().__init__()
+        self.existing_hashes = get_existing_hashes()
+        self.device_path = get_device_dcim_path()
+        self.remote_files = list_remote_files(self.device_path)
+
+    def run(self):
+        try:
+            deleted = 0
+            total_files = len(self.remote_files)
+            
+            if total_files == 0:
+                self.error_signal.emit("No files found on device to delete")
+                return
+
+            temp_dir = "temp_verify"
+            os.makedirs(temp_dir, exist_ok=True)
+
+            for i, filename in enumerate(self.remote_files):
+                self.update_progress.emit(i + 1, total_files, filename)
+                
+                temp_path = os.path.join(temp_dir, filename)
+                run_adb_command(["pull", f"{self.device_path}/{filename}", temp_path])
+                
+                if os.path.exists(temp_path):
+                    file_hash = calculate_hash(temp_path)
+                    if file_hash in self.existing_hashes:
+                        run_adb_command(["shell", f"rm {self.device_path}/{filename}"])
+                        deleted += 1
+                    os.remove(temp_path)
+
+            shutil.rmtree(temp_dir)
+            self.finished.emit(deleted)
+            
+        except Exception as e:
+            self.error_signal.emit(f"Deletion failed: {str(e)}")
+
 # --- GUI ---
 class BackupApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("📸 DCIM Backup Utility")
+        self.setWindowTitle("📸 DCIM Backup to Laptop")
         self.setMinimumSize(600, 750)
         self.setWindowIcon(QIcon(self.create_icon()))
         
@@ -321,7 +396,7 @@ class BackupApp(QWidget):
         icon_label.setPixmap(icon_pixmap)
         icon_label.setAlignment(Qt.AlignCenter)
         
-        title = QLabel("DCIM Backup Utility")
+        title = QLabel("DCIM Backup to Laptop")
         title.setFont(QFont("Segoe UI", 18, QFont.Bold))
         title.setStyleSheet("color: #333; margin: 0;")
         
@@ -414,7 +489,7 @@ class BackupApp(QWidget):
 
     def create_button(self, text, icon_name, tooltip, callback, layout):
         btn = QPushButton(text)
-        btn.setIcon(QIcon(f"icons/{icon_name}"))  # You'll need to provide these icons
+        btn.setIcon(QIcon(f"icons/{icon_name}"))
         btn.setIconSize(QSize(24, 24))
         btn.setToolTip(tooltip)
         btn.setCursor(Qt.PointingHandCursor)
@@ -448,7 +523,6 @@ class BackupApp(QWidget):
         layout.addWidget(btn)
 
     def create_icon(self):
-        # Create a simple icon programmatically
         pixmap = QPixmap(64, 64)
         pixmap.fill(Qt.transparent)
         
@@ -500,6 +574,11 @@ class BackupApp(QWidget):
         backup_path = get_backup_folder()
         self.status_label.setText(f"✓ {operation_name} completed ({count} items processed)\nLocation: {backup_path}")
 
+    def handle_error(self, message):
+        self.progress_container.hide()
+        self.enable_buttons()
+        QMessageBox.critical(self, "Error", message)
+
     def handle_backup(self):
         if not phone_connected():
             msg = QMessageBox()
@@ -515,6 +594,7 @@ class BackupApp(QWidget):
         self.backup_thread = BackupThread()
         self.backup_thread.update_progress.connect(self.update_progress)
         self.backup_thread.finished.connect(lambda count: self.operation_finished(count, "backup"))
+        self.backup_thread.error_signal.connect(self.handle_error)
         self.backup_thread.start()
 
     def handle_organize(self):
@@ -529,10 +609,10 @@ class BackupApp(QWidget):
         if reply == QMessageBox.Yes:
             self.start_operation("organization")
             
-            # Create and start organize thread
             self.organize_thread = OrganizeThread()
             self.organize_thread.update_progress.connect(self.update_progress)
             self.organize_thread.finished.connect(lambda count: self.operation_finished(count, "organization"))
+            self.organize_thread.error_signal.connect(self.handle_error)
             self.organize_thread.start()
         else:
             self.status_label.setText("✗ Organization canceled")
@@ -549,10 +629,10 @@ class BackupApp(QWidget):
         if reply == QMessageBox.Yes:
             self.start_operation("undo organization")
             
-            # Create and start undo thread
             self.undo_thread = UndoOrganizationThread()
             self.undo_thread.update_progress.connect(self.update_progress)
             self.undo_thread.finished.connect(lambda count: self.operation_finished(count, "undo organization"))
+            self.undo_thread.error_signal.connect(self.handle_error)
             self.undo_thread.start()
         else:
             self.status_label.setText("✗ Undo organization canceled")
@@ -594,10 +674,10 @@ class BackupApp(QWidget):
 
         self.start_operation("deletion from phone")
         
-        # Create and start delete thread
         self.delete_thread = DeleteThread()
         self.delete_thread.update_progress.connect(self.update_progress)
         self.delete_thread.finished.connect(lambda count: self.operation_finished(count, "deletion from phone"))
+        self.delete_thread.error_signal.connect(self.handle_error)
         self.delete_thread.start()
 
     def open_backup_folder(self):
@@ -656,7 +736,6 @@ class BackupApp(QWidget):
             else:
                 self.status_label.setText("✗ Move skipped. Old files remain in old folder.")
 
-        # Update config
         with open(CONFIG_FILE, "w") as f:
             f.write(new_base_folder)
 
@@ -686,7 +765,6 @@ class BackupApp(QWidget):
         }
         """
 
-# --- Entry Point ---
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
@@ -694,7 +772,7 @@ if __name__ == "__main__":
     font = QFont("Segoe UI", 10)
     app.setFont(font)
     
-    # Set application style (Fusion is more modern than default)
+    # Set application style
     app.setStyle("Fusion")
     
     window = BackupApp()

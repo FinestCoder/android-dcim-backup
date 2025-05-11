@@ -1,2 +1,2 @@
-UI
-case: if you delete a file from backups even then its hash is stored so next itme when you backup fromphone it gets skipped this could be an issue
+- Case: if you delete a file from backups even then its hash is stored so next itme when you backup fromphone it gets skipped this could be an issue: display this as a warning to user
+- Option to switch to superuser and just automate everything no clicks reqd by user

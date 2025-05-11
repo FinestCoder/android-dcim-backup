@@ -3,3 +3,6 @@ adb-tools
 DCIM_Backups
 backup_log.txt
 config.txt
+build
+dist
+improvements.txt
